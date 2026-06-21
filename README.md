@@ -1,5 +1,9 @@
 How to get the app running:
 
+Quick check: Make sure you have python 3.11 installed onto your computer before getting started on this
+
+
+
 Step 1: extract the zip file to access the folder inside.
 
 step 2: right click on the background and open up the terminal
