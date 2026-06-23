@@ -11,6 +11,7 @@ Features:
 """
 from __future__ import annotations
 
+import json
 import logging
 import math
 import os
@@ -78,6 +79,7 @@ OUTPUTS_DIR = APP_BASE_DIR / "Outputs"
 DREAMIFY_OUTPUT_DIR = APP_BASE_DIR / "Dreamify_Output"
 DREAM_VIDEOS_DIR = APP_BASE_DIR / "Dream_Videos"
 TIMELAPSES_DIR = APP_BASE_DIR / "Timelapses"
+APP_SETTINGS_PATH = APP_BASE_DIR / "apvd_user_settings.json"
 
 def _read_int_env(name: str, default: int) -> int:
     try:
@@ -132,6 +134,20 @@ LOSS_MODE_HELP = {
     "Structure Stable": "Adds gentle L1 shape pressure so objects stay more like themselves.",
     "Sharp Detail": "Adds L1 plus edge loss for stronger outlines and details.",
     "Experimental Structure": "Heavier structure mix using L1 and edge loss. Useful for cars/characters, but more experimental.",
+}
+
+USER_LEVEL_CHOICES = ["Newbie", "Amateur", "Expert", "Nerd"]
+USER_LEVEL_HELP = {
+    "Newbie": "Basic training, model loading, preview, and the safest visible controls.",
+    "Amateur": "Adds generation, Dreamify, prompts, and the common tuning controls.",
+    "Expert": "Adds DDPM diffusion, evolution, memory tools, and deeper model controls.",
+    "Nerd": "Shows everything. No seatbelt. Full cockpit mode.",
+}
+USER_LEVEL_SECTION_VISIBILITY = {
+    "Newbie": {"Hardware", "Sources And Model", "Training Settings", "Preview"},
+    "Amateur": {"Hardware", "Sources And Model", "Training Settings", "Generation Tools", "Generation Settings", "Prompt And Personality", "Preview"},
+    "Expert": {"Hardware", "Sources And Model", "Training Settings", "Generation Tools", "Generation Settings", "Latent DDPM Diffusion", "Prompt And Personality", "Evolution And Memory", "Preview"},
+    "Nerd": "ALL",
 }
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 PERSONALITY_PRESETS = {
@@ -494,9 +510,15 @@ class APVDApp:
         self.device_choice_var = tk.StringVar(value=self._device_choice_from_device(self.device))
         self.hardware_status_var = tk.StringVar(value="")
         self.header_device_var = tk.StringVar(value="")
+        self.user_level_var = tk.StringVar(value="Amateur")
+        self.user_level_help_var = tk.StringVar(value=USER_LEVEL_HELP["Amateur"])
         
         # Reconstruction Mode
         self.reconstruction_mode_var = tk.StringVar(value="RGB VAE")
+        self._settings_save_after_id: str | None = None
+        self._settings_traces_installed = False
+        
+        self._load_app_settings()
         
         self.is_training = False
         self.training_thread: threading.Thread | None = None
@@ -553,10 +575,15 @@ class APVDApp:
         self._theme_widgets: list[tuple[tk.Widget, str]] = []
         self._section_states: dict[str, tk.BooleanVar] = {}
         self._section_buttons: dict[str, ttk.Button] = {}
+        self._section_containers: dict[str, ttk.LabelFrame] = {}
+        self._section_pack_options: dict[str, dict[str, object]] = {}
+        self._section_order: list[str] = []
         self._theme_palette = self._palette_for_mode()
 
         self._configure_styles()
         self._build_ui()
+        self._install_settings_autosave()
+        self._apply_user_level(update_status=False)
         self._refresh_memory_list()
         self._create_output_window()
 
@@ -593,6 +620,7 @@ class APVDApp:
                 self._after_ids.discard(after_id)
 
     def _close(self):
+        self._save_app_settings()
         self._closing = True
         self.is_training = False
         self.training_pause_event.set()
@@ -1093,6 +1121,183 @@ class APVDApp:
                 self.live_overlay_canvas.configure(bg="black")
             except tk.TclError:
                 pass
+
+    def _settings_variables(self) -> dict[str, tk.Variable]:
+        names = [
+            "epochs_var", "resolution_var", "batch_size_var", "loader_workers_var",
+            "prefetch_batches_var", "dataset_cache_items_var", "training_intensity_var",
+            "learning_rate_var", "precision_mode_var", "loss_mode_var", "mixed_precision_var",
+            "nan_guard_var", "video_stride_var", "video_max_frames_var", "iterations_var",
+            "show_iterations_var", "auto_cycle_var", "dream_cycle_var", "blend_mode_var",
+            "blend_count_var", "output_count_var", "use_mini_diffusion_var",
+            "diffusion_steps_var", "diffusion_strength_var", "dream_strength_var",
+            "memory_pull_var", "dreamify_frame_skip_var", "keep_original_audio_var",
+            "live_resolution_var", "live_target_fps_var", "live_dream_strength_var",
+            "live_memory_pull_var", "live_capture_mode_var", "live_show_fps_var",
+            "live_mini_diffusion_var", "live_display_mode_var", "live_overlay_opacity_var",
+            "live_clickthrough_overlay_var", "use_latent_diffusion_var",
+            "latent_diffusion_timesteps_var", "latent_diffusion_strength_var",
+            "personality_var", "generation_prompt_var", "include_memory_training_var",
+            "memory_training_limit_var", "memory_recent_weight_var", "dream_fps_var",
+            "dream_video_seconds_var", "dream_video_fps_var", "dream_video_audio_mode_var",
+            "dream_video_audio_source_var", "dream_structure_video_source_var",
+            "dream_structure_guidance_var", "dream_autoregressive_var",
+            "dream_feedback_strength_var", "latent_drift_var", "motion_smoothness_var",
+            "dream_instability_var", "evolution_count_var", "judge_top_k_var",
+            "judge_min_score_var", "memory_finder_top_k_var", "evolution_selection_var",
+            "theme_mode_var", "training_preview_enabled_var", "timelapse_enabled_var",
+            "training_video_layout_var", "device_choice_var", "user_level_var",
+            "reconstruction_mode_var",
+        ]
+        return {name: getattr(self, name) for name in names if hasattr(self, name)}
+
+    def _load_app_settings(self) -> None:
+        try:
+            if not APP_SETTINGS_PATH.exists():
+                return
+            data = json.loads(APP_SETTINGS_PATH.read_text(encoding="utf-8"))
+            if not isinstance(data, dict):
+                return
+        except Exception:
+            logger.debug("Could not load APVD user settings.", exc_info=True)
+            return
+
+        saved_vars = data.get("variables", {})
+        if isinstance(saved_vars, dict):
+            for name, value in saved_vars.items():
+                var = getattr(self, name, None)
+                if not isinstance(var, tk.Variable):
+                    continue
+                try:
+                    if name == "device_choice_var" and value not in self._available_device_choices():
+                        continue
+                    if name == "user_level_var" and value not in USER_LEVEL_CHOICES:
+                        continue
+                    if name == "theme_mode_var" and value not in ("Auto", "Day", "Night"):
+                        continue
+                    if name == "reconstruction_mode_var" and value not in ("RGB VAE", "Wavelet"):
+                        continue
+                    var.set(value)
+                except Exception:
+                    logger.debug("Skipping saved setting %s=%r", name, value, exc_info=True)
+
+        scales = data.get("scales", {})
+        if isinstance(scales, dict):
+            self._pending_scale_settings = scales
+        else:
+            self._pending_scale_settings = {}
+        self._pending_section_states = data.get("sections", {}) if isinstance(data.get("sections", {}), dict) else {}
+        self.user_level_help_var.set(USER_LEVEL_HELP.get(self.user_level_var.get(), USER_LEVEL_HELP["Amateur"]))
+
+    def _collect_app_settings(self) -> dict[str, object]:
+        variables = {}
+        for name, var in self._settings_variables().items():
+            try:
+                variables[name] = var.get()
+            except Exception:
+                continue
+        scales = {}
+        for name in ("var_scale", "speed_scale"):
+            scale = getattr(self, name, None)
+            if scale is not None:
+                try:
+                    scales[name] = float(scale.get())
+                except Exception:
+                    pass
+        sections = {}
+        for title, state in self._section_states.items():
+            try:
+                sections[title] = bool(state.get())
+            except Exception:
+                pass
+        return {"version": 1, "saved_at": datetime.now().isoformat(timespec="seconds"), "variables": variables, "scales": scales, "sections": sections}
+
+    def _save_app_settings(self) -> None:
+        try:
+            APP_SETTINGS_PATH.write_text(json.dumps(self._collect_app_settings(), indent=2), encoding="utf-8")
+        except Exception:
+            logger.debug("Could not save APVD user settings.", exc_info=True)
+
+    def _queue_settings_save(self, *_args) -> None:
+        if self._closing or not getattr(self, "_settings_traces_installed", False):
+            return
+        if self._settings_save_after_id is not None:
+            try:
+                self.root.after_cancel(self._settings_save_after_id)
+            except tk.TclError:
+                pass
+        self._settings_save_after_id = self.root.after(500, self._save_app_settings)
+
+    def _install_settings_autosave(self) -> None:
+        if self._settings_traces_installed:
+            return
+        for var in self._settings_variables().values():
+            try:
+                var.trace_add("write", self._queue_settings_save)
+            except Exception:
+                pass
+        for name in ("var_scale", "speed_scale"):
+            scale = getattr(self, name, None)
+            if scale is not None:
+                scale.configure(command=lambda _value, self=self: self._queue_settings_save())
+        self._settings_traces_installed = True
+
+    def _restore_post_ui_settings(self) -> None:
+        scales = getattr(self, "_pending_scale_settings", {})
+        if isinstance(scales, dict):
+            for name, value in scales.items():
+                scale = getattr(self, name, None)
+                if scale is not None:
+                    try:
+                        scale.set(float(value))
+                    except Exception:
+                        pass
+        sections = getattr(self, "_pending_section_states", {})
+        if isinstance(sections, dict):
+            for title, open_state in sections.items():
+                state = self._section_states.get(title)
+                button = self._section_buttons.get(title)
+                container = self._section_containers.get(title)
+                if state is None or button is None or container is None:
+                    continue
+                try:
+                    body = container.winfo_children()[1]
+                    if bool(open_state):
+                        body.pack(fill=tk.X, pady=(8, 0))
+                        button.configure(text="-")
+                    else:
+                        body.forget()
+                        button.configure(text="+")
+                    state.set(bool(open_state))
+                except Exception:
+                    pass
+
+    def _apply_user_level(self, *_args, update_status: bool = True) -> None:
+        level = self.user_level_var.get()
+        if level not in USER_LEVEL_CHOICES:
+            level = "Amateur"
+            self.user_level_var.set(level)
+        visible = USER_LEVEL_SECTION_VISIBILITY.get(level, "ALL")
+        self.user_level_help_var.set(USER_LEVEL_HELP.get(level, USER_LEVEL_HELP["Amateur"]))
+        for container in self._section_containers.values():
+            try:
+                container.pack_forget()
+            except tk.TclError:
+                pass
+        for title in self._section_order:
+            container = self._section_containers.get(title)
+            if container is None:
+                continue
+            should_show = visible == "ALL" or title in visible
+            if not should_show:
+                continue
+            try:
+                container.pack(**self._section_pack_options.get(title, {"fill": tk.X, "padx": 12, "pady": 6}))
+            except tk.TclError:
+                pass
+        if update_status and hasattr(self, "status_var"):
+            self.status_var.set(f"User level set to {level}: {self.user_level_help_var.get()}")
+        self._queue_settings_save()
 
     def _category_label(self, parent: tk.Widget, text: str, row: int) -> None:
         ttk.Label(parent, text=text, style="Category.TLabel").grid(row=row, column=0, columnspan=6, sticky=tk.W, pady=(10, 4))
@@ -1768,7 +1973,11 @@ Hardware Status
 
     def _make_section(self, parent: tk.Widget, title: str, *, open_by_default: bool = True) -> ttk.Frame:
         container = ttk.LabelFrame(parent, padding=(10, 8))
-        container.pack(fill=tk.X, padx=12, pady=6)
+        pack_options = {"fill": tk.X, "padx": 12, "pady": 6}
+        container.pack(**pack_options)
+        self._section_containers[title] = container
+        self._section_pack_options[title] = pack_options
+        self._section_order.append(title)
         header = ttk.Frame(container, style="Surface.TFrame")
         header.pack(fill=tk.X)
         body = ttk.Frame(container, style="Surface.TFrame")
@@ -1784,6 +1993,7 @@ Hardware Status
                 body.pack(fill=tk.X, pady=(8, 0))
                 state.set(True)
                 button.configure(text="-")
+            self._queue_settings_save()
 
         button = ttk.Button(header, text="-" if open_by_default else "+", width=3, command=toggle)
         button.pack(side=tk.LEFT)
@@ -1833,7 +2043,12 @@ Hardware Status
         theme_box = ttk.Combobox(header, textvariable=self.theme_mode_var, values=("Auto", "Day", "Night"), state="readonly", width=8)
         theme_box.pack(side=tk.RIGHT)
         theme_box.bind("<<ComboboxSelected>>", self._set_theme)
+        ttk.Label(header, text="User Level:").pack(side=tk.RIGHT, padx=(12, 6))
+        level_box = ttk.Combobox(header, textvariable=self.user_level_var, values=USER_LEVEL_CHOICES, state="readonly", width=9)
+        level_box.pack(side=tk.RIGHT)
+        level_box.bind("<<ComboboxSelected>>", self._apply_user_level)
         self._refresh_hardware_status()
+        ttk.Label(content, textvariable=self.user_level_help_var, style="Muted.TLabel").pack(fill=tk.X, padx=12, pady=(0, 4))
 
         hardware_frame = self._make_section(content, "Hardware", open_by_default=True)
         self._category_label(hardware_frame, "Compute Device", 0)
@@ -2091,6 +2306,7 @@ Hardware Status
         self.canvas = self._register_theme_widget(tk.Canvas(self.canvas_frame, width=512, height=512, bg=self._theme_palette["canvas"], highlightthickness=1, highlightbackground=self._theme_palette["canvas_border"]), "canvas")
         self.canvas.pack()
         self._apply_registered_theme()
+        self._restore_post_ui_settings()
 
     IMAGE_FILE_TYPES = [("Image files", "*.png *.jpg *.jpeg *.bmp *.gif *.webp"), ("All files", "*.*")]
     FILE_TYPES = IMAGE_FILE_TYPES
@@ -2679,7 +2895,8 @@ Hardware Status
                 if completed:
                     self._after(0, lambda: self.status_var.set("Memory evolution training finished."))
             except Exception as exc:
-                self._after(0, lambda: messagebox.showerror("Memory Retrain", str(exc)))
+                error_message = str(exc)
+                self._after(0, lambda msg=error_message: messagebox.showerror("Memory Retrain", msg))
             finally:
                 self._finish_training()
 
@@ -3376,7 +3593,8 @@ Hardware Status
                     video_paths=self.video_paths, reset_model=False
                 )
         except Exception as e:
-            self._after(0, lambda: messagebox.showerror("Error", str(e)))
+            error_message = str(e)
+            self._after(0, lambda msg=error_message: messagebox.showerror("Error", msg))
         finally:
             if not self.is_training:
                 self._after(0, lambda: self.status_var.set("Training stopped."))
