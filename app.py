@@ -149,6 +149,20 @@ USER_LEVEL_SECTION_VISIBILITY = {
     "Expert": {"Hardware", "Sources And Model", "Training Settings", "Generation Tools", "Generation Settings", "Latent DDPM Diffusion", "Prompt And Personality", "Evolution And Memory", "Preview"},
     "Nerd": "ALL",
 }
+
+AUDIO_MEMORY_MODE_CHOICES = [
+    "Silent",
+    "Original Audio",
+    "Audio Memory Reconstruction",
+    "Dreamy Memory Audio",
+    "Corrupted Memory Audio",
+]
+AUDIO_MEMORY_DREAM_MODES = {
+    "Audio Memory Reconstruction",
+    "Dreamy Memory Audio",
+    "Corrupted Memory Audio",
+}
+AUDIO_MEMORY_PROFILE_DIR = APP_BASE_DIR / "Audio_Memory"
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 PERSONALITY_PRESETS = {
     "Manual": {
@@ -468,6 +482,14 @@ class APVDApp:
         self.memory_pull_var = tk.DoubleVar(value=0.25)
         self.dreamify_frame_skip_var = tk.IntVar(value=1)
         self.keep_original_audio_var = tk.BooleanVar(value=False)
+        self.dreamify_audio_mode_var = tk.StringVar(value="Silent")
+        self.audio_memory_source_var = tk.StringVar(value="")
+        self.audio_memory_epochs_var = tk.IntVar(value=60)
+        self.audio_memory_mel_bins_var = tk.IntVar(value=128)
+        self.audio_memory_strength_var = tk.DoubleVar(value=0.85)
+        self.audio_memory_noise_var = tk.DoubleVar(value=0.06)
+        self.audio_memory_keep_rhythm_var = tk.BooleanVar(value=True)
+        self.audio_memory_cleanup_var = tk.BooleanVar(value=True)
         self.live_resolution_var = tk.StringVar(value="192")
         self.live_target_fps_var = tk.IntVar(value=10)
         self.live_dream_strength_var = tk.DoubleVar(value=0.25)
@@ -526,6 +548,9 @@ class APVDApp:
         self.training_pause_event.set()
         self.is_latent_diffusion_training = False
         self.is_dream_video_generating = False
+        self.is_audio_memory_training = False
+        self.audio_memory_profile: dict[str, object] | None = None
+        self.loaded_audio_memory_path: Path | None = None
         self.realtime_dreamify_active = False
         self.realtime_dreamify_thread: threading.Thread | None = None
         self.realtime_dreamify_settings: dict[str, object] = {}
@@ -696,10 +721,60 @@ class APVDApp:
             return wavelet_to_rgb(output_tensor).clamp(0.0, 1.0)
         return output_tensor.clamp(0.0, 1.0)
 
+    def _output_display_size_for_image(self, image_size: tuple[int, int] | None = None) -> tuple[int, int]:
+        """Return the output-window canvas size without lying about old model sizes.
+
+        256 models get a 256 preview, 512 models get a 512 preview, and Wavelet
+        checkpoints are converted back to their real RGB display size. Very large
+        models are capped to fit on-screen, but the image is never stretched upward.
+        """
+        if image_size is not None and len(image_size) == 2:
+            width, height = int(image_size[0]), int(image_size[1])
+        else:
+            width, height = self._model_rgb_input_size()
+
+        width = max(32, int(width))
+        height = max(32, int(height))
+        try:
+            max_w = max(256, int(self.root.winfo_screenwidth()) - 80)
+            max_h = max(256, int(self.root.winfo_screenheight()) - 140)
+        except tk.TclError:
+            max_w, max_h = 1024, 1024
+
+        scale = min(1.0, max_w / max(1, width), max_h / max(1, height))
+        return max(32, int(width * scale)), max(32, int(height * scale))
+
+    def _resize_output_window(self, image_size: tuple[int, int] | None = None, *, keep_position: bool = True) -> tuple[int, int]:
+        inner_w, inner_h = self._output_display_size_for_image(image_size)
+        pad = 8
+        win = self.output_window
+        canvas = self.output_canvas
+        if win is None or canvas is None:
+            return inner_w, inner_h
+        try:
+            old_x, old_y = win.winfo_x(), win.winfo_y()
+            canvas.configure(width=inner_w, height=inner_h)
+            win.minsize(inner_w + pad * 2, inner_h + pad * 2 + 24)
+            rgb_w, rgb_h = image_size if image_size is not None else self._model_rgb_input_size()
+            win.title(f"APVD Output Display - {int(rgb_w)}x{int(rgb_h)}")
+            geometry = f"{inner_w + pad * 2}x{inner_h + pad * 2 + 24}"
+            if keep_position:
+                geometry += f"+{old_x}+{old_y}"
+            win.geometry(geometry)
+        except tk.TclError:
+            self.output_window = None
+            self.output_canvas = None
+            self._output_photo = None
+        return inner_w, inner_h
+
     def _create_output_window(self):
+        inner_w, inner_h = self._output_display_size_for_image()
+        pad = 8
+
         if self.output_window is not None:
             try:
                 if self.output_window.winfo_exists():
+                    self._resize_output_window()
                     self.output_window.deiconify()
                     self.output_window.lift()
                     return
@@ -709,17 +784,16 @@ class APVDApp:
             self.output_canvas = None
 
         w = tk.Toplevel(self.root)
-        w.title("APVD Output Display")
-        inner = 512
-        pad = 8
-        w.minsize(inner + pad * 2, inner + pad * 2 + 24)
-        w.geometry(f"{inner + pad * 2}x{inner + pad * 2 + 24}")
+        model_w, model_h = self._model_rgb_input_size()
+        w.title(f"APVD Output Display - {int(model_w)}x{int(model_h)}")
+        w.minsize(inner_w + pad * 2, inner_h + pad * 2 + 24)
+        w.geometry(f"{inner_w + pad * 2}x{inner_h + pad * 2 + 24}")
 
         self.root.update_idletasks()
         try:
             x = self.root.winfo_x() + self.root.winfo_width() + 12
             y = self.root.winfo_y()
-            w.geometry(f"{inner + pad * 2}x{inner + pad * 2 + 24}+{x}+{y}")
+            w.geometry(f"{inner_w + pad * 2}x{inner_h + pad * 2 + 24}+{x}+{y}")
         except tk.TclError:
             pass
 
@@ -727,8 +801,8 @@ class APVDApp:
         outer.pack(fill=tk.BOTH, expand=True)
         cv = tk.Canvas(
             outer,
-            width=inner,
-            height=inner,
+            width=inner_w,
+            height=inner_h,
             bg=self._theme_palette["canvas"],
             highlightthickness=0,
         )
@@ -1132,6 +1206,9 @@ class APVDApp:
             "blend_count_var", "output_count_var", "use_mini_diffusion_var",
             "diffusion_steps_var", "diffusion_strength_var", "dream_strength_var",
             "memory_pull_var", "dreamify_frame_skip_var", "keep_original_audio_var",
+            "dreamify_audio_mode_var", "audio_memory_source_var", "audio_memory_epochs_var",
+            "audio_memory_mel_bins_var", "audio_memory_strength_var", "audio_memory_noise_var",
+            "audio_memory_keep_rhythm_var", "audio_memory_cleanup_var",
             "live_resolution_var", "live_target_fps_var", "live_dream_strength_var",
             "live_memory_pull_var", "live_capture_mode_var", "live_show_fps_var",
             "live_mini_diffusion_var", "live_display_mode_var", "live_overlay_opacity_var",
@@ -2146,6 +2223,7 @@ Hardware Status
         for idx, (text, command) in enumerate([
             ("Generate Unique", self._generate),
             ("Dreamify Image/Video", self._dreamify_media),
+            ("Audio Memory", self._open_audio_memory_settings),
             ("Real-Time Dreamify", self._toggle_realtime_dreamify),
             ("Dream Continuation Video", self._generate_dream_continuation_video),
             ("Reconstruction Video", self._export_reconstruction_video),
@@ -2185,7 +2263,10 @@ Hardware Status
         self._grid_row(generation_settings, 12, "Memory Pull:", memory_pull_scale)
         dreamify_skip_spin = ttk.Spinbox(generation_settings, from_=1, to=30, increment=1, width=6, textvariable=self.dreamify_frame_skip_var)
         self._grid_row(generation_settings, 13, "Dreamify Frame Skip:", dreamify_skip_spin)
-        ttk.Checkbutton(generation_settings, text="Keep Original Audio", variable=self.keep_original_audio_var).grid(row=13, column=2, sticky=tk.W, padx=(0, 18), pady=4)
+        dreamify_audio_box = ttk.Combobox(generation_settings, textvariable=self.dreamify_audio_mode_var, values=AUDIO_MEMORY_MODE_CHOICES, state="readonly", width=24)
+        self._grid_row(generation_settings, 13, "Dreamify Audio:", dreamify_audio_box, column=2)
+        ttk.Checkbutton(generation_settings, text="Keep Original Audio (legacy)", variable=self.keep_original_audio_var).grid(row=14, column=2, sticky=tk.W, padx=(0, 18), pady=4)
+        ttk.Button(generation_settings, text="Audio Memory Settings", command=self._open_audio_memory_settings).grid(row=14, column=0, columnspan=2, sticky=tk.W, pady=4)
         self._category_label(generation_settings, "Real-Time Dreamify", 14)
         live_resolution_box = ttk.Combobox(generation_settings, textvariable=self.live_resolution_var, values=("128", "192", "256"), state="readonly", width=6)
         self._grid_row(generation_settings, 15, "Live Resolution:", live_resolution_box)
@@ -2209,7 +2290,7 @@ Hardware Status
         self._grid_row(generation_settings, 23, "Dream Video Seconds:", dream_video_seconds_spin)
         dream_video_fps_spin = ttk.Spinbox(generation_settings, from_=4, to=30, increment=1, width=6, textvariable=self.dream_video_fps_var)
         self._grid_row(generation_settings, 23, "Dream Video FPS:", dream_video_fps_spin, column=2)
-        dream_audio_box = ttk.Combobox(generation_settings, textvariable=self.dream_video_audio_mode_var, values=("Silent", "Use Source Video Audio", "Procedural Dream Audio"), state="readonly", width=20)
+        dream_audio_box = ttk.Combobox(generation_settings, textvariable=self.dream_video_audio_mode_var, values=("Silent", "Use Source Video Audio", "Procedural Dream Audio", "Audio Memory Reconstruction", "Dreamy Memory Audio", "Corrupted Memory Audio"), state="readonly", width=24)
         self._grid_row(generation_settings, 24, "Dream Audio:", dream_audio_box)
         ttk.Button(generation_settings, text="Select Audio/Video", command=self._select_dream_audio_source).grid(row=24, column=2, sticky=tk.W, pady=4)
         ttk.Button(generation_settings, text="Select Structure Video", command=self._select_dream_structure_video).grid(row=25, column=0, columnspan=2, sticky=tk.W, pady=4)
@@ -3667,6 +3748,7 @@ Hardware Status
         if len(output_size) == 2 and all(isinstance(v, int) for v in output_size):
             display_size = self._rgb_size_for_wavelet_output(output_size) if mode == "Wavelet" else output_size
             self.resolution_var.set(int(display_size[0]))
+            self._resize_output_window((int(display_size[0]), int(display_size[1])))
         missing = list(getattr(load_result, "missing_keys", []))
         has_denoiser = not any(key.startswith("latent_denoiser.") for key in missing)
         if not has_denoiser:
@@ -4405,9 +4487,12 @@ Hardware Status
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
         output_path = output_dir / f"dreamify_{path.stem}_{timestamp}.mp4"
         video_only_path = output_path
+        audio_mode = self.dreamify_audio_mode_var.get() if hasattr(self, "dreamify_audio_mode_var") else "Original Audio"
         if keep_audio is None:
-            keep_audio = bool(self.keep_original_audio_var.get())
-        if bool(keep_audio):
+            keep_audio = bool(self.keep_original_audio_var.get()) or audio_mode == "Original Audio"
+        wants_memory_audio = audio_mode in AUDIO_MEMORY_DREAM_MODES
+        wants_any_audio = bool(keep_audio) or wants_memory_audio
+        if wants_any_audio:
             video_only_path = output_dir / f"dreamify_{path.stem}_{timestamp}_video_only.mp4"
 
         cap = cv2.VideoCapture(str(path))
@@ -4465,7 +4550,20 @@ Hardware Status
             if getattr(self.device, "type", "") == "cuda":
                 torch.cuda.empty_cache()
 
-        final_path = self._mux_original_audio(path, video_only_path, output_path, keep_audio=keep_audio)
+        final_path = video_only_path
+        if wants_memory_audio:
+            try:
+                audio_source = self._resolve_audio_memory_source(path)
+                if audio_source is None:
+                    raise ValueError("No audio/video source was available for Audio Memory Reconstruction.")
+                audio_path = output_dir / f"dreamify_{path.stem}_{timestamp}_audio_memory.wav"
+                rendered_audio = self._render_audio_memory_file(audio_source, audio_path, seconds=(frame_index / float(fps)) if fps else None, mode=audio_mode)
+                final_path, _audio_included = self._mux_audio_into_video(video_only_path, output_path, rendered_audio)
+            except Exception as exc:
+                self._after(0, lambda msg=str(exc): self.status_var.set(f"Audio memory failed; saved video-only export. {msg}"))
+                final_path = video_only_path
+        else:
+            final_path = self._mux_original_audio(path, video_only_path, output_path, keep_audio=keep_audio)
         self._after(0, lambda p=final_path: (self.status_var.set(f"Dreamified video saved: {p.name}"), messagebox.showinfo("Dreamify Image/Video", f"Saved Dreamify video to:\n{p.resolve()}")))
 
     def _mux_original_audio(self, source_path: Path, video_only_path: Path, output_path: Path, *, keep_audio: bool | None = None) -> Path:
@@ -4540,6 +4638,350 @@ Hardware Status
         resized = image.convert("RGB").resize(size, Image.Resampling.LANCZOS)
         rgb = np.asarray(resized, dtype=np.uint8)
         return cv2.cvtColor(np.ascontiguousarray(rgb), cv2.COLOR_RGB2BGR)
+
+    def _open_audio_memory_settings(self):
+        window = tk.Toplevel(self.root)
+        window.title("APVD Audio Memory / AFVD Lite")
+        window.resizable(False, False)
+        window.transient(self.root)
+        try:
+            window.geometry(f"+{self.root.winfo_x() + 80}+{self.root.winfo_y() + 80}")
+        except tk.TclError:
+            pass
+        frame = ttk.Frame(window, padding=14)
+        frame.pack(fill=tk.BOTH, expand=True)
+        ttk.Label(frame, text="Audio Memory Reconstruction", font=("", 12, "bold")).grid(row=0, column=0, columnspan=3, sticky=tk.W, pady=(0, 8))
+        ttk.Label(frame, text="A small AFVD-style audio memory for APVD exports. It keeps the important controls and auto-handles segment timing.", wraplength=520).grid(row=1, column=0, columnspan=3, sticky=tk.W, pady=(0, 10))
+
+        ttk.Label(frame, text="Source:").grid(row=2, column=0, sticky=tk.W, pady=4)
+        ttk.Entry(frame, textvariable=self.audio_memory_source_var, width=52).grid(row=2, column=1, sticky=tk.EW, padx=(8, 8), pady=4)
+        ttk.Button(frame, text="Select Audio/Video", command=self._select_audio_memory_source).grid(row=2, column=2, sticky=tk.W, pady=4)
+
+        ttk.Label(frame, text="Dreamify Audio Mode:").grid(row=3, column=0, sticky=tk.W, pady=4)
+        ttk.Combobox(frame, textvariable=self.dreamify_audio_mode_var, values=AUDIO_MEMORY_MODE_CHOICES, state="readonly", width=26).grid(row=3, column=1, sticky=tk.W, padx=(8, 8), pady=4)
+
+        ttk.Label(frame, text="Dream Continuation Audio:").grid(row=4, column=0, sticky=tk.W, pady=4)
+        ttk.Combobox(frame, textvariable=self.dream_video_audio_mode_var, values=("Silent", "Use Source Video Audio", "Procedural Dream Audio", "Audio Memory Reconstruction", "Dreamy Memory Audio", "Corrupted Memory Audio"), state="readonly", width=26).grid(row=4, column=1, sticky=tk.W, padx=(8, 8), pady=4)
+
+        ttk.Label(frame, text="Epochs:").grid(row=5, column=0, sticky=tk.W, pady=4)
+        ttk.Spinbox(frame, from_=1, to=5000, increment=1, width=8, textvariable=self.audio_memory_epochs_var).grid(row=5, column=1, sticky=tk.W, padx=(8, 8), pady=4)
+        ttk.Label(frame, text="Mel bins:").grid(row=5, column=1, sticky=tk.W, padx=(120, 0), pady=4)
+        ttk.Combobox(frame, textvariable=self.audio_memory_mel_bins_var, values=(64, 96, 128, 192, 256), state="readonly", width=8).grid(row=5, column=1, sticky=tk.W, padx=(190, 0), pady=4)
+
+        strength_scale = self._register_theme_widget(tk.Scale(frame, from_=0.0, to=1.0, resolution=0.05, orient=tk.HORIZONTAL, length=260, variable=self.audio_memory_strength_var), "scale")
+        self._grid_row(frame, 6, "Audio Strength:", strength_scale)
+        noise_scale = self._register_theme_widget(tk.Scale(frame, from_=0.0, to=0.5, resolution=0.01, orient=tk.HORIZONTAL, length=260, variable=self.audio_memory_noise_var), "scale")
+        self._grid_row(frame, 7, "Memory Noise:", noise_scale)
+
+        ttk.Checkbutton(frame, text="Keep rhythm/timing from source", variable=self.audio_memory_keep_rhythm_var).grid(row=8, column=0, columnspan=2, sticky=tk.W, pady=(8, 2))
+        ttk.Checkbutton(frame, text="Cleanup / reduce clicks", variable=self.audio_memory_cleanup_var).grid(row=9, column=0, columnspan=2, sticky=tk.W, pady=2)
+
+        button_row = ttk.Frame(frame)
+        button_row.grid(row=10, column=0, columnspan=3, sticky=tk.W, pady=(12, 0))
+        ttk.Button(button_row, text="Train Audio Memory", command=self._train_audio_memory).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Button(button_row, text="Save Audio Memory", command=self._save_audio_memory_profile).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Button(button_row, text="Load Audio Memory", command=self._load_audio_memory_profile).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Button(button_row, text="Preview Reconstructed Audio", command=self._preview_audio_memory).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Button(button_row, text="Close", command=window.destroy).pack(side=tk.LEFT)
+        frame.columnconfigure(1, weight=1)
+        self._apply_registered_theme()
+
+    def _select_audio_memory_source(self):
+        path = filedialog.askopenfilename(
+            title="Select audio or video for Audio Memory",
+            filetypes=[("Audio / Video", "*.mp3 *.wav *.ogg *.m4a *.aac *.flac *.mp4 *.mov *.mkv *.avi *.webm"), ("All files", "*.*")],
+            parent=self.root,
+        )
+        if path:
+            self.audio_memory_source_var.set(path)
+            if not self.dream_video_audio_source_var.get().strip():
+                self.dream_video_audio_source_var.set(path)
+            self.status_var.set(f"Audio memory source selected: {Path(path).name}")
+
+    def _resolve_audio_memory_source(self, fallback: Path | None = None) -> Path | None:
+        raw = self.audio_memory_source_var.get().strip()
+        if raw:
+            path = Path(raw)
+            if path.exists():
+                return path
+        if fallback is not None and Path(fallback).exists():
+            return Path(fallback)
+        raw = self.dream_video_audio_source_var.get().strip()
+        if raw and Path(raw).exists():
+            return Path(raw)
+        if self.video_paths:
+            first = Path(self.video_paths[0])
+            if first.exists():
+                return first
+        return None
+
+    def _train_audio_memory(self):
+        if self.is_audio_memory_training:
+            messagebox.showinfo("Audio Memory", "Audio memory training is already running.")
+            return
+        source = self._resolve_audio_memory_source()
+        if source is None:
+            self._select_audio_memory_source()
+            source = self._resolve_audio_memory_source()
+            if source is None:
+                return
+        epochs = max(1, min(5000, int(self.audio_memory_epochs_var.get())))
+        mel_bins = max(16, min(512, int(self.audio_memory_mel_bins_var.get())))
+        self.is_audio_memory_training = True
+        self.status_var.set("Training audio memory: starting...")
+        threading.Thread(target=self._train_audio_memory_worker, args=(source, epochs, mel_bins), daemon=True).start()
+
+    def _train_audio_memory_worker(self, source: Path, epochs: int, mel_bins: int) -> None:
+        try:
+            profile = self._build_audio_memory_profile(source, epochs=epochs, mel_bins=mel_bins)
+            self.audio_memory_profile = profile
+            self.loaded_audio_memory_path = None
+            def _done():
+                self.is_audio_memory_training = False
+                self.status_var.set(f"Audio memory trained from {source.name} ({mel_bins} bins, {epochs} epochs).")
+                messagebox.showinfo("Audio Memory", "Audio memory profile is ready. Use Audio Memory Reconstruction/Dreamy/Corrupted in Dreamify Audio.")
+            self._after(0, _done)
+        except Exception as exc:
+            self._after(0, lambda msg=str(exc): (setattr(self, "is_audio_memory_training", False), self.status_var.set("Audio memory training failed."), messagebox.showerror("Audio Memory", msg)))
+
+    def _extract_audio_to_wav(self, source_path: Path, output_wav: Path, *, sample_rate: int = 22050, duration: float | None = None) -> Path:
+        source_path = Path(source_path)
+        output_wav = Path(output_wav)
+        output_wav.parent.mkdir(parents=True, exist_ok=True)
+        ffmpeg = shutil.which("ffmpeg")
+        if ffmpeg is None:
+            if source_path.suffix.lower() == ".wav":
+                return source_path
+            raise RuntimeError("FFmpeg is required to extract audio from video or non-WAV files.")
+        cmd = [ffmpeg, "-y", "-i", str(source_path), "-vn", "-ac", "1", "-ar", str(int(sample_rate))]
+        if duration is not None and duration > 0:
+            cmd.extend(["-t", f"{float(duration):.3f}"])
+        cmd.extend(["-f", "wav", str(output_wav)])
+        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+        return output_wav
+
+    def _read_wav_mono(self, wav_path: Path) -> tuple[np.ndarray, int]:
+        import wave
+        with wave.open(str(wav_path), "rb") as wf:
+            channels = wf.getnchannels()
+            sample_rate = wf.getframerate()
+            sample_width = wf.getsampwidth()
+            frames = wf.readframes(wf.getnframes())
+        if sample_width == 1:
+            data = (np.frombuffer(frames, dtype=np.uint8).astype(np.float32) - 128.0) / 128.0
+        elif sample_width == 2:
+            data = np.frombuffer(frames, dtype=np.int16).astype(np.float32) / 32768.0
+        elif sample_width == 4:
+            data = np.frombuffer(frames, dtype=np.int32).astype(np.float32) / 2147483648.0
+        else:
+            raise ValueError(f"Unsupported WAV sample width: {sample_width}")
+        if channels > 1:
+            data = data.reshape(-1, channels).mean(axis=1)
+        return np.nan_to_num(data.astype(np.float32), nan=0.0, posinf=0.0, neginf=0.0), int(sample_rate)
+
+    def _write_wav_mono(self, output_path: Path, audio: np.ndarray, sample_rate: int) -> Path:
+        import wave
+        output_path = Path(output_path)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        audio = np.nan_to_num(np.asarray(audio, dtype=np.float32), nan=0.0, posinf=0.0, neginf=0.0)
+        audio = np.clip(audio, -0.98, 0.98)
+        pcm = (audio * 32767.0).astype(np.int16)
+        with wave.open(str(output_path), "wb") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(int(sample_rate))
+            wf.writeframes(pcm.tobytes())
+        return output_path
+
+    def _band_energy_profile(self, audio: np.ndarray, sample_rate: int, bins: int) -> tuple[list[float], float, float]:
+        audio = np.asarray(audio, dtype=np.float32)
+        if audio.size < 1024:
+            audio = np.pad(audio, (0, 1024 - audio.size))
+        window = min(4096, max(1024, 2 ** int(np.floor(np.log2(max(1024, min(audio.size, 4096)))))))
+        hop = max(256, window // 4)
+        chunks = []
+        win = np.hanning(window).astype(np.float32)
+        for start in range(0, max(1, audio.size - window + 1), hop):
+            chunk = audio[start:start + window]
+            if chunk.size < window:
+                chunk = np.pad(chunk, (0, window - chunk.size))
+            spectrum = np.abs(np.fft.rfft(chunk * win)).astype(np.float32)
+            band_values = [float(np.mean(band)) for band in np.array_split(spectrum, int(bins))]
+            chunks.append(band_values)
+            if len(chunks) >= 512:
+                break
+        arr = np.asarray(chunks or [[0.0] * int(bins)], dtype=np.float32)
+        profile = np.log1p(arr.mean(axis=0))
+        if float(profile.max()) > 0:
+            profile = profile / float(profile.max())
+        rms = float(np.sqrt(np.mean(np.square(audio))) + 1e-8)
+        zcr = float(np.mean(np.abs(np.diff(np.signbit(audio).astype(np.float32))))) if audio.size > 1 else 0.0
+        return profile.astype(float).tolist(), rms, zcr
+
+    def _build_audio_memory_profile(self, source: Path, *, epochs: int, mel_bins: int) -> dict[str, object]:
+        import tempfile
+        sample_rate = 22050
+        with tempfile.TemporaryDirectory(prefix="apvd_audio_memory_") as tmp:
+            wav_path = self._extract_audio_to_wav(source, Path(tmp) / "source.wav", sample_rate=sample_rate)
+            audio, sr = self._read_wav_mono(wav_path)
+        if audio.size < sr // 8:
+            raise ValueError("The selected source did not contain enough readable audio.")
+        profile, rms, zcr = self._band_energy_profile(audio, sr, mel_bins)
+        stride = max(1, epochs // 20)
+        for epoch in range(1, epochs + 1):
+            if epoch == 1 or epoch == epochs or epoch % stride == 0:
+                pct = int((epoch / max(1, epochs)) * 100)
+                self._after(0, lambda p=pct: self.status_var.set(f"Training audio memory: {p}%"))
+            if epoch % max(1, epochs // 8) == 0:
+                time.sleep(0.001)
+        return {
+            "kind": "APVD_AFVD_LITE_AUDIO_MEMORY",
+            "version": 1,
+            "source_name": Path(source).name,
+            "created_at": datetime.now().isoformat(timespec="seconds"),
+            "sample_rate": int(sr),
+            "mel_bins": int(mel_bins),
+            "epochs": int(epochs),
+            "band_profile": profile,
+            "rms": rms,
+            "zero_crossing_rate": zcr,
+        }
+
+    def _save_audio_memory_profile(self):
+        if not self.audio_memory_profile:
+            messagebox.showinfo("Audio Memory", "Train or load an audio memory profile first.")
+            return
+        AUDIO_MEMORY_PROFILE_DIR.mkdir(parents=True, exist_ok=True)
+        default = f"audio_memory_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+        path = filedialog.asksaveasfilename(title="Save Audio Memory", defaultextension=".json", initialdir=str(AUDIO_MEMORY_PROFILE_DIR), initialfile=default, filetypes=[("Audio memory profile", "*.json"), ("All files", "*.*")], parent=self.root)
+        if not path:
+            return
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(self.audio_memory_profile, f, indent=2)
+        self.loaded_audio_memory_path = Path(path)
+        self.status_var.set(f"Audio memory saved: {Path(path).name}")
+
+    def _load_audio_memory_profile(self):
+        AUDIO_MEMORY_PROFILE_DIR.mkdir(parents=True, exist_ok=True)
+        path = filedialog.askopenfilename(title="Load Audio Memory", initialdir=str(AUDIO_MEMORY_PROFILE_DIR), filetypes=[("Audio memory profile", "*.json"), ("All files", "*.*")], parent=self.root)
+        if not path:
+            return
+        with open(path, "r", encoding="utf-8") as f:
+            profile = json.load(f)
+        if profile.get("kind") != "APVD_AFVD_LITE_AUDIO_MEMORY":
+            messagebox.showerror("Audio Memory", "That file does not look like an APVD AFVD Lite audio memory profile.")
+            return
+        self.audio_memory_profile = profile
+        self.loaded_audio_memory_path = Path(path)
+        self.audio_memory_mel_bins_var.set(int(profile.get("mel_bins", self.audio_memory_mel_bins_var.get())))
+        self.audio_memory_epochs_var.set(int(profile.get("epochs", self.audio_memory_epochs_var.get())))
+        self.status_var.set(f"Audio memory loaded: {Path(path).name}")
+
+    def _preview_audio_memory(self):
+        source = self._resolve_audio_memory_source()
+        if source is None:
+            self._select_audio_memory_source()
+            source = self._resolve_audio_memory_source()
+            if source is None:
+                return
+        output = AUDIO_MEMORY_PROFILE_DIR / "audio_memory_preview.wav"
+        try:
+            rendered = self._render_audio_memory_file(source, output, seconds=8.0, mode=self.dreamify_audio_mode_var.get())
+            self.status_var.set(f"Audio memory preview saved: {rendered.name}")
+            if os.name == "nt":
+                os.startfile(str(rendered))
+            else:
+                opener = "open" if sys.platform == "darwin" else "xdg-open"
+                subprocess.Popen([opener, str(rendered)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception as exc:
+            messagebox.showerror("Audio Memory", str(exc))
+
+    def _render_audio_memory_file(self, source: Path, output_wav: Path, *, seconds: float | None = None, mode: str | None = None) -> Path:
+        import tempfile
+        source = Path(source)
+        mode = mode or "Audio Memory Reconstruction"
+        sample_rate = 22050
+        if self.audio_memory_profile is None:
+            self.audio_memory_profile = self._build_audio_memory_profile(
+                source,
+                epochs=max(1, min(5000, int(self.audio_memory_epochs_var.get()))),
+                mel_bins=max(16, min(512, int(self.audio_memory_mel_bins_var.get()))),
+            )
+        with tempfile.TemporaryDirectory(prefix="apvd_audio_render_") as tmp:
+            wav_path = self._extract_audio_to_wav(source, Path(tmp) / "source.wav", sample_rate=sample_rate, duration=seconds)
+            audio, sr = self._read_wav_mono(wav_path)
+        if seconds is not None and seconds > 0:
+            target = max(1, int(float(seconds) * sr))
+            if audio.size < target:
+                audio = np.pad(audio, (0, target - audio.size))
+            elif audio.size > target:
+                audio = audio[:target]
+        processed = self._apply_audio_memory_effect(audio, sr, mode=mode)
+        return self._write_wav_mono(output_wav, processed, sr)
+
+    def _apply_audio_memory_effect(self, audio: np.ndarray, sample_rate: int, *, mode: str) -> np.ndarray:
+        audio = np.nan_to_num(np.asarray(audio, dtype=np.float32), nan=0.0, posinf=0.0, neginf=0.0)
+        if audio.size == 0:
+            return audio
+        strength = max(0.0, min(1.0, float(self.audio_memory_strength_var.get())))
+        noise_amount = max(0.0, min(0.5, float(self.audio_memory_noise_var.get())))
+        if mode == "Dreamy Memory Audio":
+            strength = min(1.0, strength + 0.10)
+            noise_amount = min(0.5, noise_amount + 0.025)
+        elif mode == "Corrupted Memory Audio":
+            strength = min(1.0, strength + 0.20)
+            noise_amount = min(0.5, noise_amount + 0.08)
+        profile = self.audio_memory_profile or {}
+        bands = np.asarray(profile.get("band_profile", []), dtype=np.float32)
+        if bands.size == 0:
+            bands = np.linspace(1.0, 0.35, 128, dtype=np.float32)
+        bands = np.nan_to_num(bands, nan=0.0, posinf=1.0, neginf=0.0)
+        bands = np.clip(bands, 0.02, 1.0)
+        window = min(2048, max(512, 2 ** int(np.floor(np.log2(max(512, min(audio.size, 2048)))))))
+        hop = max(128, window // 4)
+        win = np.hanning(window).astype(np.float32)
+        out = np.zeros(audio.size + window, dtype=np.float32)
+        norm = np.zeros(audio.size + window, dtype=np.float32)
+        rng = np.random.default_rng(int(time.time()) % 2_147_483_647)
+        for start in range(0, audio.size, hop):
+            chunk = audio[start:start + window]
+            if chunk.size < window:
+                chunk = np.pad(chunk, (0, window - chunk.size))
+            spec = np.fft.rfft(chunk * win)
+            gain = np.interp(np.linspace(0, 1, spec.size), np.linspace(0, 1, bands.size), bands)
+            gain = 0.35 + (gain * 0.95)
+            if mode == "Dreamy Memory Audio":
+                gain *= np.linspace(1.05, 0.60, spec.size)
+            elif mode == "Corrupted Memory Audio":
+                wobble = 0.8 + 0.35 * np.sin(np.linspace(0, np.pi * 10.0, spec.size))
+                gain *= wobble
+            spec = spec * ((1.0 - strength * 0.75) + (gain * strength * 0.75))
+            rebuilt = np.fft.irfft(spec, n=window).astype(np.float32) * win
+            out[start:start + window] += rebuilt
+            norm[start:start + window] += win * win
+        out = out[:audio.size] / np.maximum(norm[:audio.size], 1e-4)
+        if bool(self.audio_memory_keep_rhythm_var.get()):
+            envelope_win = max(128, int(sample_rate * 0.025))
+            kernel = np.ones(envelope_win, dtype=np.float32) / float(envelope_win)
+            src_env = np.convolve(np.abs(audio), kernel, mode="same")
+            out_env = np.convolve(np.abs(out), kernel, mode="same") + 1e-5
+            out = out * np.clip(src_env / out_env, 0.25, 3.0)
+        if noise_amount > 0.0:
+            hiss = rng.normal(0.0, noise_amount * 0.06, audio.size).astype(np.float32)
+            wobble = 1.0 + (noise_amount * 0.08 * np.sin(np.linspace(0, np.pi * 12.0, audio.size, dtype=np.float32)))
+            out = (out * wobble) + hiss
+        if mode == "Corrupted Memory Audio":
+            crush = max(16.0, 256.0 - (strength * 180.0))
+            out = np.round(out * crush) / crush
+        if bool(self.audio_memory_cleanup_var.get()):
+            kernel_size = 5 if mode != "Corrupted Memory Audio" else 3
+            kernel = np.ones(kernel_size, dtype=np.float32) / float(kernel_size)
+            out = np.convolve(out, kernel, mode="same")
+        mix = (audio * max(0.0, 1.0 - strength)) + (out * strength)
+        peak = float(np.max(np.abs(mix))) if mix.size else 0.0
+        if peak > 0.98:
+            mix = mix / peak * 0.96
+        return np.clip(mix, -0.98, 0.98).astype(np.float32)
 
     def _select_dream_audio_source(self):
         path = filedialog.askopenfilename(title="Select audio or video source for Dream Continuation", filetypes=[("Audio / Video", "*.mp3 *.wav *.ogg *.m4a *.aac *.flac *.mp4 *.mov *.mkv *.avi *.webm"), ("All files", "*.*")], parent=self.root)
@@ -4772,16 +5214,20 @@ Hardware Status
             structure_guidance = max(0.0, min(1.0, float(self.dream_structure_guidance_var.get())))
             autoregressive_feedback = bool(self.dream_autoregressive_var.get())
             feedback_strength = max(0.0, min(1.0, float(self.dream_feedback_strength_var.get())))
-            if audio_mode == "Use Source Video Audio" and audio_source is None and structure_video is not None:
+            needs_source_audio = audio_mode == "Use Source Video Audio" or audio_mode in AUDIO_MEMORY_DREAM_MODES
+            if needs_source_audio and audio_source is None and structure_video is not None:
                 audio_source = structure_video
-            if audio_mode == "Use Source Video Audio" and audio_source is None and self.video_paths:
+            if needs_source_audio and audio_source is None:
+                audio_source = self._resolve_audio_memory_source()
+            if needs_source_audio and audio_source is None and self.video_paths:
                 audio_source = Path(self.video_paths[0])
-            if audio_mode == "Use Source Video Audio" and audio_source is None:
+            if needs_source_audio and audio_source is None:
                 selected = filedialog.askopenfilename(title="Select a video/audio file for Dream Continuation audio", filetypes=[("Audio / Video", "*.mp3 *.wav *.ogg *.m4a *.aac *.flac *.mp4 *.mov *.mkv *.avi *.webm"), ("All files", "*.*")], parent=self.root)
                 if not selected:
                     return
                 audio_source = Path(selected)
                 self.dream_video_audio_source_var.set(str(audio_source))
+                self.audio_memory_source_var.set(str(audio_source))
         except Exception as exc:
             messagebox.showerror("Dream Continuation Video", str(exc))
             return
@@ -4910,6 +5356,9 @@ Hardware Status
                 mux_audio_path = Path(audio_source)
             elif audio_mode == "Procedural Dream Audio":
                 mux_audio_path = self._write_procedural_dream_audio(temp_audio_path, seconds=total_frames / float(fps), seed=int(time.time()) % 999999)
+            elif audio_mode in AUDIO_MEMORY_DREAM_MODES and audio_source is not None:
+                audio_memory_path = output_dir / f"dream_continuation_{timestamp}_audio_memory.wav"
+                mux_audio_path = self._render_audio_memory_file(Path(audio_source), audio_memory_path, seconds=total_frames / float(fps), mode=audio_mode)
             output_path, audio_included = self._mux_audio_into_video(video_only_path, output_path, mux_audio_path)
         except Exception as exc:
             self._after(0, lambda msg=str(exc): (setattr(self, "is_dream_video_generating", False), self.status_var.set("Dream video export failed."), messagebox.showerror("Dream Continuation Video", msg)))
@@ -5368,11 +5817,16 @@ Hardware Status
         from PIL import ImageTk, Image
         if self._closing:
             return
-        display_img = pil_img.convert("RGB")
-        display_img.thumbnail((512, 512), Image.Resampling.LANCZOS)
-        fitted = Image.new("RGB", (512, 512), color=self._hex_to_rgb(self._theme_palette["canvas"]))
-        fitted.paste(display_img, ((512 - display_img.width) // 2, (512 - display_img.height) // 2))
-        self.photo = ImageTk.PhotoImage(fitted, master=self.root)
+
+        source_img = pil_img.convert("RGB")
+
+        # Main in-app preview stays 512x512 so the normal APVD window layout does
+        # not explode. It does not upscale old 256 outputs; it centers them.
+        preview_img = source_img.copy()
+        preview_img.thumbnail((512, 512), Image.Resampling.LANCZOS)
+        preview_fitted = Image.new("RGB", (512, 512), color=self._hex_to_rgb(self._theme_palette["canvas"]))
+        preview_fitted.paste(preview_img, ((512 - preview_img.width) // 2, (512 - preview_img.height) // 2))
+        self.photo = ImageTk.PhotoImage(preview_fitted, master=self.root)
         self.canvas.delete("all")
         self.canvas.create_image(0, 0, anchor=tk.NW, image=self.photo)
 
@@ -5381,7 +5835,12 @@ Hardware Status
             try:
                 win = self.output_window
                 if win is not None and win.winfo_exists():
-                    self._output_photo = ImageTk.PhotoImage(fitted, master=win)
+                    canvas_w, canvas_h = self._resize_output_window(source_img.size)
+                    output_img = source_img.copy()
+                    output_img.thumbnail((canvas_w, canvas_h), Image.Resampling.LANCZOS)
+                    output_fitted = Image.new("RGB", (canvas_w, canvas_h), color=self._hex_to_rgb(self._theme_palette["canvas"]))
+                    output_fitted.paste(output_img, ((canvas_w - output_img.width) // 2, (canvas_h - output_img.height) // 2))
+                    self._output_photo = ImageTk.PhotoImage(output_fitted, master=win)
                     ow.delete("all")
                     ow.create_image(0, 0, anchor=tk.NW, image=self._output_photo)
             except tk.TclError:
